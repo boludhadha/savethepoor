@@ -256,8 +256,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except Exception as e:
             logger.warning(f"Could not notify debtor {debtor_id}: {e}")
 
-async def main():
-    """Start the bot using ApplicationBuilder (without the dispatcher)."""
+def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
@@ -265,15 +264,15 @@ async def main():
 
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Add command and callback query handlers.
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("register", register))
     application.add_handler(CommandHandler("addexpense", add_expense))
     application.add_handler(CommandHandler("summary", summary))
     application.add_handler(CallbackQueryHandler(button_handler))
 
-    await application.run_polling()
+    # This call is blocking and handles the event loop internally.
+    application.run_polling()
 
 if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+    main()
+

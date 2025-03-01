@@ -5,97 +5,106 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters
 )
 
-# Enable logging
+# Set up logging.
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Global storage
+# Global storage.
 # registered_users: Maps user_id to a display name.
 registered_users = {}
 
-# transactions: Maps transaction_id (an integer) to a dictionary.
-# Each transaction is structured as:
-# {
-#    "id": transaction_id,
-#    "spender": <user_id of person who paid>,
-#    "amount": <total amount spent>,
-#    "description": <expense description>,
-#    "share": <equal share for each debtor>,
-#    "debts": { debtor_id: status, ... }  # Status: "pending", "marked", "confirmed"
-# }
+# transactions: Maps transaction_id to a transaction dictionary.
+# Each transaction has:
+#  - "id": transaction id,
+#  - "spender": user_id of the person who paid,
+#  - "amount": total amount spent,
+#  - "description": expense description,
+#  - "share": (amount / total_registered),
+#  - "debts": dict mapping debtor_id to status ("pending", "marked", "confirmed").
 transactions = {}
-next_transaction_id = 1  # Simple counter for transaction IDs
+next_transaction_id = 1  # Simple counter for transaction IDs.
+
+# Conversation states.
+AMOUNT, DESCRIPTION = range(2)
+
+# ---------- Command Handlers & Conversation for Adding Expense ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Register the user and welcome them."""
+    """Register the user and show the main menu."""
     user = update.effective_user
-    name = user.username if user.username else user.first_name
+    name = user.username or user.first_name
     if user.id not in registered_users:
         registered_users[user.id] = name
-        await update.message.reply_text(
-            f"Hi {name}! You have been registered in the friends circle.\n"
-            "You can add an expense with /addexpense <amount> <description>\n"
-            "and check your summary with /summary."
+    main_menu = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Add Expense", callback_data="menu_add_expense")],
+        [InlineKeyboardButton("View Summary", callback_data="menu_view_summary")]
+    ])
+    await update.message.reply_text(
+        f"Welcome, {name}! You are now registered in the friends circle.",
+        reply_markup=main_menu
+    )
+
+async def add_expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Entry point for adding an expense.
+    This is triggered either by the /addexpense command or when the user taps "Add Expense".
+    """
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
+            "Please enter the amount you spent (you can include commas):"
         )
     else:
-        await update.message.reply_text("You are already registered in the friends circle.")
+        await update.message.reply_text(
+            "Please enter the amount you spent (you can include commas):"
+        )
+    return AMOUNT
 
-async def register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Explicit registration (alias of /start)."""
-    user = update.effective_user
-    name = user.username if user.username else user.first_name
-    if user.id in registered_users:
-        await update.message.reply_text("You are already registered.")
-    else:
-        registered_users[user.id] = name
-        await update.message.reply_text("You have been registered in the friends circle!")
-
-async def add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Add an expense.
-    Usage: /addexpense <amount> <description>
-    The bot calculates each friend’s share (excluding the spender) and sends each debtor
-    an inline “Paid” button to mark their payment.
-    """
-    global next_transaction_id
-    user = update.effective_user
-    spender_id = user.id
-
-    if spender_id not in registered_users:
-        await update.message.reply_text("You are not registered. Use /register to join the friends circle.")
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /addexpense <amount> <description>")
-        return
-
+async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive and process the amount."""
+    text = update.message.text.strip().replace(",", "")
     try:
-        amount = float(args[0])
+        amount = float(text)
     except ValueError:
-        await update.message.reply_text("Invalid amount. Please enter a numeric value.")
-        return
+        await update.message.reply_text(
+            "That doesn't look like a valid number. Please enter the amount again:"
+        )
+        return AMOUNT
+    context.user_data["expense_amount"] = amount
+    await update.message.reply_text("Great! Now please enter a description for the expense:")
+    return DESCRIPTION
 
-    description = " ".join(args[1:])
-    # Calculate share: Divide by number of other registered users.
-    num_debtors = len(registered_users) - 1
-    if num_debtors <= 0:
-        await update.message.reply_text("No other participants registered to share the expense.")
-        return
+async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive the description, record the expense, and notify debtors."""
+    description = update.message.text.strip()
+    amount = context.user_data.get("expense_amount")
+    spender_id = update.effective_user.id
+    # Ensure the spender is registered.
+    if spender_id not in registered_users:
+        registered_users[spender_id] = update.effective_user.username or update.effective_user.first_name
 
-    share = amount / num_debtors
+    total_participants = len(registered_users)
+    if total_participants == 0:
+        await update.message.reply_text("No participants registered. Please register first.")
+        return ConversationHandler.END
+
+    # Split the expense equally among all registered users.
+    share = amount / total_participants
+    global next_transaction_id
     transaction_id = next_transaction_id
     next_transaction_id += 1
 
-    # Build debts dictionary: each friend (except spender) starts with status "pending"
+    # Create a debts dictionary for all users except the spender.
     debts = {uid: "pending" for uid in registered_users if uid != spender_id}
 
-    # Store the transaction.
     transactions[transaction_id] = {
         "id": transaction_id,
         "spender": spender_id,
@@ -106,7 +115,8 @@ async def add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     }
 
     await update.message.reply_text(
-        f"Expense added: '{description}' for {amount:.2f}.\nEach friend owes {share:.2f}."
+        f"Expense recorded: '{description}' for {amount:.2f}.\n"
+        f"Each participant's share is {share:.2f}."
     )
 
     # Notify each debtor with an inline "Paid" button.
@@ -117,65 +127,121 @@ async def add_expense(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ])
             await context.bot.send_message(
                 chat_id=debtor_id,
-                text=(f"You owe {share:.2f} for expense: '{description}' covered by {registered_users[spender_id]}."),
+                text=(
+                    f"You owe {share:.2f} for expense '{description}' "
+                    f"covered by {registered_users[spender_id]}."
+                ),
                 reply_markup=keyboard
             )
         except Exception as e:
             logger.warning(f"Could not send notification to user {debtor_id}: {e}")
 
+    # Show the main menu again.
+    main_menu = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Add Expense", callback_data="menu_add_expense")],
+        [InlineKeyboardButton("View Summary", callback_data="menu_view_summary")]
+    ])
+    await update.message.reply_text("What would you like to do next?", reply_markup=main_menu)
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the add expense conversation."""
+    if update.message:
+        await update.message.reply_text("Expense addition cancelled.")
+    elif update.callback_query:
+        await update.callback_query.message.reply_text("Expense addition cancelled.")
+    return ConversationHandler.END
+
+# ---------- Summary Command ----------
+
 async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Provide a summary for the user.
-    For expenses you covered, list each friend along with the status of their payment.
-    For expenses you owe, list the details along with your payment status.
+    Provide a summary showing two sections:
+      • 📥 People who owe you (expenses you paid)
+      • 📤 You owe (expenses you are a debtor in)
     """
     user = update.effective_user
     if user.id not in registered_users:
-        await update.message.reply_text("You are not registered. Use /register to join the friends circle.")
+        await update.message.reply_text("You are not registered. Please use /start to register.")
         return
 
-    owed_to_you = []
-    you_owe = []
-
+    owe_me = []
+    i_owe = []
     for tx in transactions.values():
-        # If the user is the spender, list each debtor’s status.
         if tx["spender"] == user.id:
             for debtor, status in tx["debts"].items():
-                owed_to_you.append(
+                owe_me.append(
                     f"{registered_users.get(debtor, str(debtor))}: owes {tx['share']:.2f} [{status}] for '{tx['description']}'"
                 )
-        # If the user is a debtor in this transaction.
         elif user.id in tx["debts"]:
             status = tx["debts"][user.id]
-            you_owe.append(
+            i_owe.append(
                 f"To {registered_users.get(tx['spender'], str(tx['spender']))}: owe {tx['share']:.2f} [{status}] for '{tx['description']}'"
             )
+    message = ""
+    if owe_me:
+        message += "📥 *People who owe you:*\n" + "\n".join(owe_me) + "\n\n"
+    if i_owe:
+        message += "📤 *You owe:*\n" + "\n".join(i_owe)
+    if not message:
+        message = "No transactions to show."
+    await update.message.reply_text(message, parse_mode="Markdown")
 
-    if not owed_to_you and not you_owe:
-        await update.message.reply_text("No transactions to show.")
-        return
+# ---------- Main Menu Callback Handler ----------
 
-    msg = ""
-    if owed_to_you:
-        msg += "People who owe you:\n" + "\n".join(owed_to_you) + "\n\n"
-    if you_owe:
-        msg += "You owe:\n" + "\n".join(you_owe)
-    await update.message.reply_text(msg)
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle main menu buttons:
+      • "Add Expense" starts the add expense conversation.
+      • "View Summary" displays the summary.
+    """
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "menu_add_expense":
+        # Trigger the expense conversation.
+        await add_expense_start(update, context)
+    elif data == "menu_view_summary":
+        # Directly show the summary.
+        user = update.effective_user
+        if user.id not in registered_users:
+            registered_users[user.id] = user.username or user.first_name
+        owe_me = []
+        i_owe = []
+        for tx in transactions.values():
+            if tx["spender"] == user.id:
+                for debtor, status in tx["debts"].items():
+                    owe_me.append(
+                        f"{registered_users.get(debtor, str(debtor))}: owes {tx['share']:.2f} [{status}] for '{tx['description']}'"
+                    )
+            elif user.id in tx["debts"]:
+                status = tx["debts"][user.id]
+                i_owe.append(
+                    f"To {registered_users.get(tx['spender'], str(tx['spender']))}: owe {tx['share']:.2f} [{status}] for '{tx['description']}'"
+                )
+        message = ""
+        if owe_me:
+            message += "📥 *People who owe you:*\n" + "\n".join(owe_me) + "\n\n"
+        if i_owe:
+            message += "📤 *You owe:*\n" + "\n".join(i_owe)
+        if not message:
+            message = "No transactions to show."
+        await query.message.reply_text(message, parse_mode="Markdown")
+
+# ---------- Callback Handler for Payment Actions ----------
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Handle callback queries from inline buttons.
-    - When a debtor clicks "Paid", mark their status as 'marked' and notify the spender.
-    - When the spender clicks "Confirm Payment", mark the debtor’s payment as 'confirmed'
-      and notify them.
+    Handle inline button presses for:
+      • "Paid": a debtor marks the expense as paid.
+      • "Confirm Payment": the spender confirms receipt.
     """
     query = update.callback_query
     data = query.data
     user = query.from_user
-    await query.answer()  # Acknowledge the callback
+    await query.answer()
 
     if data.startswith("paid:"):
-        # Format: paid:<transaction_id>
         try:
             _, tx_id_str = data.split(":")
             tx_id = int(tx_id_str)
@@ -195,11 +261,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.edit_message_text("You have already marked this expense as paid.")
             return
 
-        # Mark the debtor's payment as "marked" (pending confirmation from spender)
         tx["debts"][user.id] = "marked"
         await query.edit_message_text("Payment marked. Waiting for the spender to confirm.")
 
-        # Notify the spender with an inline "Confirm Payment" button.
+        # Notify the spender with a "Confirm Payment" button.
         spender_id = tx["spender"]
         try:
             keyboard = InlineKeyboardMarkup([
@@ -207,15 +272,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             ])
             await context.bot.send_message(
                 chat_id=spender_id,
-                text=(f"{registered_users.get(user.id)} marked as paid for expense "
-                      f"'{tx['description']}' (Share: {tx['share']:.2f})."),
+                text=(
+                    f"{registered_users.get(user.id)} marked as paid for expense '{tx['description']}' "
+                    f"(Share: {tx['share']:.2f})."
+                ),
                 reply_markup=keyboard
             )
         except Exception as e:
             logger.warning(f"Could not notify spender {spender_id}: {e}")
 
     elif data.startswith("confirm:"):
-        # Format: confirm:<transaction_id>:<debtor_id>
         try:
             _, tx_id_str, debtor_id_str = data.split(":")
             tx_id = int(tx_id_str)
@@ -229,7 +295,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         tx = transactions[tx_id]
-        # Only the spender can confirm a payment.
         if user.id != tx["spender"]:
             await query.edit_message_text("Only the spender can confirm payments.")
             return
@@ -242,19 +307,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await query.edit_message_text("This payment is not marked as paid.")
             return
 
-        # Confirm the payment.
         tx["debts"][debtor_id] = "confirmed"
         await query.edit_message_text("Payment confirmed.")
 
-        # Notify the debtor that their payment has been confirmed.
         try:
             await context.bot.send_message(
                 chat_id=debtor_id,
-                text=(f"Your payment for expense '{tx['description']}' "
-                      f"(Share: {tx['share']:.2f}) has been confirmed by {registered_users.get(user.id)}.")
+                text=(
+                    f"Your payment for expense '{tx['description']}' (Share: {tx['share']:.2f}) "
+                    f"has been confirmed by {registered_users.get(user.id)}."
+                )
             )
         except Exception as e:
             logger.warning(f"Could not notify debtor {debtor_id}: {e}")
+
+# ---------- Main Function ----------
 
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -264,15 +331,31 @@ def main():
 
     application = ApplicationBuilder().token(TOKEN).build()
 
+    # /start command.
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("register", register))
-    application.add_handler(CommandHandler("addexpense", add_expense))
+    
+    # Conversation handler for adding an expense.
+    add_expense_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("addexpense", add_expense_start),
+            CallbackQueryHandler(add_expense_start, pattern="^menu_add_expense$")
+        ],
+        states={
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_expense_amount)],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_expense_description)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)]
+    )
+    application.add_handler(add_expense_conv)
+    
+    # /summary command.
     application.add_handler(CommandHandler("summary", summary))
-    application.add_handler(CallbackQueryHandler(button_handler))
-
-    # This call is blocking and handles the event loop internally.
+    
+    # Handlers for main menu buttons and payment actions.
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(paid:|confirm:)"))
+    
     application.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

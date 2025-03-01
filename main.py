@@ -1,14 +1,16 @@
 import os
 import logging
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
 )
+import db
 
 # Set up logging.
 logging.basicConfig(
@@ -16,35 +18,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global storage.
-# registered_users: maps user_id to display name.
-registered_users = {}
-
-# transactions: maps transaction_id to a dict with details.
-# Each transaction has:
-#   "id": transaction id,
-#   "spender": user_id of the person who paid,
-#   "amount": total amount,
-#   "description": expense description,
-#   "share": (amount split among selected participants),
-#   "debts": dict mapping each debtor's user_id to status ("pending", "marked", "confirmed")
-transactions = {}
-next_transaction_id = 1  # Simple counter.
-
-# --- Conversation State Constants ---
+# Conversation state constants.
 # Registration
 REG_NAME = 0
-# Add Expense Conversation
+# Add Expense Conversation:
 AE_AMOUNT = 0
 AE_DESCRIPTION = 1
-AE_PARTICIPANTS = 2
-# Mark as Paid Conversation
+AE_SELECT = 2
+# Mark as Paid Conversation:
 MP_SELECT = 0
-# Confirm Payment Conversation
+# Confirm Payment Conversation:
 CP_SELECT = 0
 CP_DEBTOR = 1
 
-# --- Utility: Main Menu Keyboard ---
+# Utility: Main Menu Keyboard.
 def get_main_menu():
     return ReplyKeyboardMarkup(
         [["Add Expense 🤑", "View Summary 📊"], ["Mark as Paid 💸", "Confirm Payment ✅"]],
@@ -55,9 +42,10 @@ def get_main_menu():
 # --- Registration Conversation ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    if user.id in registered_users:
+    display_name = await db.get_user(user.id)
+    if display_name:
         await update.message.reply_text(
-            f"Welcome back, {registered_users[user.id]}! How far? 😎",
+            f"Welcome back, {display_name}! How far? 😎",
             reply_markup=get_main_menu()
         )
         return ConversationHandler.END
@@ -71,7 +59,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
     user = update.effective_user
-    registered_users[user.id] = name
+    await db.create_or_update_user(user.id, name)
     await update.message.reply_text(
         f"Registration complete! Welcome, {name}! Let's make money moves together 💪",
         reply_markup=get_main_menu(),
@@ -81,11 +69,11 @@ async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # --- Add Expense Conversation ---
 async def ae_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    if user.id not in registered_users:
+    if not await db.get_user(user.id):
         await update.message.reply_text("No wahala—register first with /start, abeg.")
         return ConversationHandler.END
     await update.message.reply_text(
-        "How much did you spend? (Feel free to use commas, no stress) 😂",
+        "How much did you spend? (Feel free to use commas) 😂",
         reply_markup=ReplyKeyboardRemove(),
     )
     return AE_AMOUNT
@@ -104,87 +92,103 @@ async def ae_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def ae_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     description = update.message.text.strip()
     context.user_data["ae_description"] = description
-    await update.message.reply_text(
-        "Enter a comma-separated list of display names to share the bill with.\n"
-        "Type 'all' to bill everyone (except you), if una dey tight together:"
-    )
-    return AE_PARTICIPANTS
+    # Initialize selected participants list.
+    context.user_data["selected_participants"] = []
+    # Begin selection using inline keyboard.
+    return await ae_select_start(update, context)
 
-async def ae_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
-    amount = context.user_data.get("ae_amount")
-    description = context.user_data.get("ae_description")
+async def ae_select_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     spender_id = update.effective_user.id
-
-    # Determine participants.
-    if text.lower() == "all" or text == "":
-        participants = [uid for uid in registered_users if uid != spender_id]
+    # Get all registered users from the database.
+    all_users = await db.get_all_users()  # returns list of dicts: {"user_id": ..., "display_name": ...}
+    # Available participants: all except the spender and those already selected.
+    selected = context.user_data.get("selected_participants", [])
+    available = [u for u in all_users if u["user_id"] != spender_id and u["user_id"] not in selected]
+    keyboard = []
+    for user_record in available:
+        keyboard.append([InlineKeyboardButton(user_record["display_name"], callback_data=f"select_{user_record['user_id']}")])
+    keyboard.append([InlineKeyboardButton("Done", callback_data="select_done")])
+    selected_names = ", ".join([str(uid) for uid in selected]) or "None"
+    text = f"Select participants for this expense.\nAlready selected: {selected_names}"
+    # Send (or edit) a message with the inline keyboard.
+    if update.message:
+        sent = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        names = [n.strip() for n in text.split(",") if n.strip()]
-        participants = []
-        for uid, disp in registered_users.items():
-            if uid == spender_id:
-                continue
-            if any(disp.lower() == n.lower() for n in names):
-                participants.append(uid)
-        if not participants:
-            await update.message.reply_text("E no work oh. No valid names found. Try again or type 'all':")
-            return AE_PARTICIPANTS
+        sent = await update.callback_query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    context.user_data["select_msg_id"] = sent.message_id
+    context.user_data["select_chat_id"] = sent.chat.id
+    return AE_SELECT
 
-    num = len(participants)
-    if num == 0:
-        await update.message.reply_text("No participants selected. You dey enjoy alone? Abeg try again.")
-        return ConversationHandler.END
-    share = amount / num
-
-    global next_transaction_id
-    tx_id = next_transaction_id
-    next_transaction_id += 1
-    transactions[tx_id] = {
-        "id": tx_id,
-        "spender": spender_id,
-        "amount": amount,
-        "description": description,
-        "share": share,
-        "debts": {uid: "pending" for uid in participants},
-    }
-
-    await update.message.reply_text(
-        f"Expense recorded: '{description}' for ₦{amount:.2f}.\nEach selected friend owes ₦{share:.2f}.",
-        reply_markup=get_main_menu(),
-    )
-
-    # Notify each participant with a friendly message.
-    for debtor in participants:
-        try:
-            await context.bot.send_message(
-                chat_id=debtor,
-                text=(
-                    f"Hey {registered_users.get(debtor)}! You owe ₦{share:.2f} for '{description}' by {registered_users[spender_id]}. "
-                    "When you pay, mark am as paid using the 'Mark as Paid' option. No be small matter oo! 😉"
+async def ae_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    spender_id = query.from_user.id
+    if data == "select_done":
+        selected = context.user_data.get("selected_participants", [])
+        if not selected:
+            await query.edit_message_text("No participants selected. Expense canceled.", reply_markup=get_main_menu())
+            return ConversationHandler.END
+        amount = context.user_data.get("ae_amount")
+        description = context.user_data.get("ae_description")
+        num = len(selected)
+        share = amount / num
+        tx_id = await db.add_transaction(spender_id, amount, description, share, selected)
+        await query.edit_message_text(
+            f"Expense recorded: '{description}' for ₦{amount:.2f}.\nEach selected friend owes ₦{share:.2f}."
+        )
+        # Notify each selected participant.
+        for debtor in selected:
+            try:
+                debtor_disp = await db.get_user(debtor)
+                spender_disp = await db.get_user(spender_id)
+                await context.bot.send_message(
+                    chat_id=debtor,
+                    text=(
+                        f"Hey {debtor_disp}! You owe ₦{share:.2f} for '{description}' by {spender_disp}.\n"
+                        "Mark as paid when you settle up. No be small matter oo! 😉"
+                    )
                 )
-            )
-        except Exception as e:
-            logger.warning(f"Could not notify user {debtor}: {e}")
-    return ConversationHandler.END
+            except Exception as e:
+                logger.warning(f"Could not notify user {debtor}: {e}")
+        return ConversationHandler.END
+    else:
+        try:
+            uid = int(data.split("_")[1])
+        except Exception:
+            await query.answer("Invalid selection.")
+            return AE_SELECT
+        if "selected_participants" not in context.user_data:
+            context.user_data["selected_participants"] = []
+        if uid not in context.user_data["selected_participants"]:
+            context.user_data["selected_participants"].append(uid)
+        # Rebuild inline keyboard.
+        all_users = await db.get_all_users()
+        available = [u for u in all_users if u["user_id"] != spender_id and u["user_id"] not in context.user_data["selected_participants"]]
+        keyboard = []
+        for user_record in available:
+            keyboard.append([InlineKeyboardButton(user_record["display_name"], callback_data=f"select_{user_record['user_id']}")])
+        keyboard.append([InlineKeyboardButton("Done", callback_data="select_done")])
+        selected = context.user_data.get("selected_participants", [])
+        selected_names = ", ".join([str(uid) for uid in selected]) or "None"
+        text = f"Select participants for this expense.\nAlready selected: {selected_names}"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        return AE_SELECT
 
 # --- Mark as Paid Conversation ---
 async def mp_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    if user.id not in registered_users:
+    if not await db.get_user(user.id):
         await update.message.reply_text("Register first with /start, my guy.", reply_markup=get_main_menu())
         return ConversationHandler.END
-    # List pending transactions where the user is a debtor.
-    pending = []
-    for tx in transactions.values():
-        if user.id in tx["debts"] and tx["debts"][user.id] == "pending":
-            pending.append(tx)
+    pending = await db.get_pending_debts_for_user(user.id)
     if not pending:
         await update.message.reply_text("Chai! You no get any pending payment at all.", reply_markup=get_main_menu())
         return ConversationHandler.END
     msg = "Pending payments:\n"
     for tx in pending:
-        msg += f"ID {tx['id']}: You owe ₦{tx['share']:.2f} for '{tx['description']}' by {registered_users.get(tx['spender'], 'Unknown')}\n"
+        spender_disp = await db.get_user(tx["spender"])
+        msg += f"ID {tx['id']}: You owe ₦{tx['share']:.2f} for '{tx['description']}' by {spender_disp}\n"
     msg += "\nEnter the transaction ID you want to mark as paid:"
     await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return MP_SELECT
@@ -197,44 +201,46 @@ async def mp_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Abeg, enter a valid transaction ID:")
         return MP_SELECT
     user = update.effective_user
-    tx = transactions.get(tx_id)
-    if not tx or user.id not in tx["debts"] or tx["debts"][user.id] != "pending":
+    pending = await db.get_pending_debts_for_user(user.id)
+    tx = None
+    for t in pending:
+        if t["id"] == tx_id:
+            tx = t
+            break
+    if not tx:
         await update.message.reply_text("Transaction no dey or don already process. Try again:")
         return MP_SELECT
-    tx["debts"][user.id] = "marked"
+    await db.mark_debt_as_marked(tx_id, user.id)
     await update.message.reply_text("Marked as paid! Waiting for confirmation from the spender.", reply_markup=get_main_menu())
-    # Notify the spender.
-    spender_id = tx["spender"]
     try:
+        spender_disp = await db.get_user(tx["spender"])
         await context.bot.send_message(
-            chat_id=spender_id,
+            chat_id=tx["spender"],
             text=(
-                f"{registered_users[user.id]} don mark payment for transaction {tx_id} ('{tx['description']}').\n"
+                f"{await db.get_user(user.id)} don mark payment for transaction {tx_id} ('{tx['description']}').\n"
                 "When you confirm, select 'Confirm Payment' from the menu."
             )
         )
     except Exception as e:
-        logger.warning(f"Could not notify spender {spender_id}: {e}")
+        logger.warning(f"Could not notify spender {tx['spender']}: {e}")
     return ConversationHandler.END
 
 # --- Confirm Payment Conversation ---
 async def cp_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    # List transactions for which the user (as spender) has marked payments.
-    pending_conf = []
-    for tx in transactions.values():
-        if tx["spender"] == user.id:
-            for debtor, status in tx["debts"].items():
-                if status == "marked":
-                    pending_conf.append(tx)
-                    break
+    pending_conf = await db.get_pending_confirmations_for_spender(user.id)
     if not pending_conf:
         await update.message.reply_text("No payment confirmation pending for you, boss!", reply_markup=get_main_menu())
         return ConversationHandler.END
     msg = "Payments pending confirmation:\n"
     for tx in pending_conf:
-        marked_debtors = [registered_users.get(d, str(d)) for d, status in tx["debts"].items() if status == "marked"]
-        msg += f"ID {tx['id']}: Marked by: {', '.join(marked_debtors)} for '{tx['description']}' (each owes ₦{tx['share']:.2f})\n"
+        marked = await db.get_marked_debtors(tx["id"])
+        # Get display names for marked debtors.
+        marked_names = []
+        for debtor in marked:
+            name = await db.get_user(debtor)
+            marked_names.append(name)
+        msg += f"ID {tx['id']}: Marked by: {', '.join(marked_names)} for '{tx['description']}' (each owes ₦{tx['share']:.2f})\n"
     msg += "\nEnter the transaction ID to confirm payment:"
     await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
     return CP_SELECT
@@ -247,11 +253,16 @@ async def cp_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Enter a valid transaction ID, please:")
         return CP_SELECT
     user = update.effective_user
-    tx = transactions.get(tx_id)
-    if not tx or tx["spender"] != user.id:
-        await update.message.reply_text("No transaction found or you no be spender for that transaction. Try again:")
+    pending_conf = await db.get_pending_confirmations_for_spender(user.id)
+    tx = None
+    for t in pending_conf:
+        if t["id"] == tx_id:
+            tx = t
+            break
+    if not tx:
+        await update.message.reply_text("Transaction not found or you no be spender for that transaction. Try again:")
         return CP_SELECT
-    marked_debtors = [d for d, status in tx["debts"].items() if status == "marked"]
+    marked_debtors = await db.get_marked_debtors(tx_id)
     if not marked_debtors:
         await update.message.reply_text("No marked payment for this transaction.", reply_markup=get_main_menu())
         return ConversationHandler.END
@@ -260,12 +271,13 @@ async def cp_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data["cp_tx_id"] = tx_id
         return CP_DEBTOR
     debtor_id = marked_debtors[0]
-    tx["debts"][debtor_id] = "confirmed"
-    await update.message.reply_text(f"Payment confirmed for {registered_users.get(debtor_id)}. Cheers!", reply_markup=get_main_menu())
+    await db.confirm_debt(tx_id, debtor_id)
+    debtor_disp = await db.get_user(debtor_id)
+    await update.message.reply_text(f"Payment confirmed for {debtor_disp}. Cheers!", reply_markup=get_main_menu())
     try:
         await context.bot.send_message(
             chat_id=debtor_id,
-            text=f"Your payment for '{tx['description']}' (ID {tx_id}) has been confirmed by {registered_users[user.id]}. Thanks o! 🙌"
+            text=f"Your payment for '{tx['description']}' (ID {tx_id}) has been confirmed by {await db.get_user(user.id)}. Thanks o! 🙌"
         )
     except Exception as e:
         logger.warning(f"Could not notify debtor {debtor_id}: {e}")
@@ -275,25 +287,22 @@ async def cp_debtor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     debtor_name = update.message.text.strip().lower()
     tx_id = context.user_data.get("cp_tx_id")
     user = update.effective_user
-    tx = transactions.get(tx_id)
-    if not tx or tx["spender"] != user.id:
-        await update.message.reply_text("Something no set. Try again later.", reply_markup=get_main_menu())
-        return ConversationHandler.END
-    marked_debtors = [d for d, status in tx["debts"].items() if status == "marked"]
+    marked_debtors = await db.get_marked_debtors(tx_id)
     debtor_id = None
     for d in marked_debtors:
-        if registered_users.get(d, "").lower() == debtor_name:
+        name = (await db.get_user(d)).lower()
+        if name == debtor_name:
             debtor_id = d
             break
     if debtor_id is None:
         await update.message.reply_text("No matching debtor found. Type the correct name:")
         return CP_DEBTOR
-    tx["debts"][debtor_id] = "confirmed"
-    await update.message.reply_text(f"Payment confirmed for {registered_users.get(debtor_id)}.", reply_markup=get_main_menu())
+    await db.confirm_debt(tx_id, debtor_id)
+    await update.message.reply_text(f"Payment confirmed for {await db.get_user(debtor_id)}.", reply_markup=get_main_menu())
     try:
         await context.bot.send_message(
             chat_id=debtor_id,
-            text=f"Your payment for '{tx['description']}' (ID {tx_id}) has been confirmed by {registered_users[user.id]}. You dey alright! 👍"
+            text=f"Your payment for transaction ID {tx_id} has been confirmed by {await db.get_user(user.id)}. You dey alright! 👍"
         )
     except Exception as e:
         logger.warning(f"Could not notify debtor {debtor_id}: {e}")
@@ -302,27 +311,34 @@ async def cp_debtor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # --- View Summary Handler ---
 async def view_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if user.id not in registered_users:
+    if not await db.get_user(user.id):
         await update.message.reply_text("Abeg register first with /start.", reply_markup=get_main_menu())
         return
-    owe_me = []
-    i_owe = []
-    for tx in transactions.values():
-        if tx["spender"] == user.id:
-            for debtor, status in tx["debts"].items():
-                owe_me.append(f"{registered_users.get(debtor, str(debtor))}: owes ₦{tx['share']:.2f} [{status}] for '{tx['description']}'")
-        elif user.id in tx["debts"]:
-            i_owe.append(f"To {registered_users.get(tx['spender'], str(tx['spender']))}: owe ₦{tx['share']:.2f} [{tx['debts'][user.id]}] for '{tx['description']}'")
+    owe_me, i_owe = await db.get_summary_for_user(user.id)
     msg = ""
     if owe_me:
-        msg += "📥 *People who owe you:*\n" + "\n".join(owe_me) + "\n\n"
+        lines = []
+        for row in owe_me:
+            debtor_disp = await db.get_user(row["debtor_id"])
+            lines.append(f"{debtor_disp}: owes ₦{row['share']:.2f} [{row['status']}] for '{row['description']}'")
+        msg += "📥 *People who owe you:*\n" + "\n".join(lines) + "\n\n"
     if i_owe:
-        msg += "📤 *You owe:*\n" + "\n".join(i_owe)
+        lines = []
+        for row in i_owe:
+            spender_disp = await db.get_user(row["spender"])
+            lines.append(f"To {spender_disp}: owe ₦{row['share']:.2f} [{row['status']}] for '{row['description']}'")
+        msg += "📤 *You owe:*\n" + "\n".join(lines)
     if not msg:
         msg = "No transactions to show. Enjoy your day, oga!"
     await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-# --- Main Function ---
+# --- Startup and Shutdown Functions ---
+async def on_startup(app):
+    await db.init_db()
+
+async def on_shutdown(app):
+    await db.close_db()
+
 def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
@@ -341,20 +357,20 @@ def main():
     )
     application.add_handler(reg_conv_handler)
 
-    # Add Expense Conversation Handler (triggered by "Add Expense" or /addexpense)
+    # Add Expense Conversation Handler (triggered by "Add Expense 🤑" or /addexpense)
     add_expense_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Add Expense 🤑$"), ae_start),
                       CommandHandler("addexpense", ae_start)],
         states={
             AE_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ae_amount)],
             AE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ae_description)],
-            AE_PARTICIPANTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ae_participants)],
+            AE_SELECT: [CallbackQueryHandler(ae_select_callback, pattern="^(select_).*")],
         },
         fallbacks=[CommandHandler("cancel", lambda update, context: update.message.reply_text("Cancelled.", reply_markup=get_main_menu()))],
     )
     application.add_handler(add_expense_conv)
 
-    # Mark as Paid Conversation Handler (triggered by "Mark as Paid")
+    # Mark as Paid Conversation Handler (triggered by "Mark as Paid 💸")
     mark_paid_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Mark as Paid 💸$"), mp_start)],
         states={
@@ -364,7 +380,7 @@ def main():
     )
     application.add_handler(mark_paid_conv)
 
-    # Confirm Payment Conversation Handler (triggered by "Confirm Payment")
+    # Confirm Payment Conversation Handler (triggered by "Confirm Payment ✅")
     confirm_payment_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^Confirm Payment ✅$"), cp_start)],
         states={
@@ -375,11 +391,11 @@ def main():
     )
     application.add_handler(confirm_payment_conv)
 
-    # View Summary Handler (triggered by "View Summary" or /summary)
+    # View Summary Handler (triggered by "View Summary 📊" or /summary)
     application.add_handler(MessageHandler(filters.Regex("^View Summary 📊$"), view_summary))
     application.add_handler(CommandHandler("summary", view_summary))
 
-    application.run_polling()
+    application.run_polling(on_startup=on_startup, on_shutdown=on_shutdown)
 
 if __name__ == "__main__":
     main()

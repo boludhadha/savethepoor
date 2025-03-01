@@ -1,6 +1,13 @@
 import os
 import logging
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+import asyncio
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -100,7 +107,7 @@ async def ae_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def ae_select_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     spender_id = update.effective_user.id
     # Get all registered users from the database.
-    all_users = await db.get_all_users()  # returns list of dicts: {"user_id": ..., "display_name": ...}
+    all_users = await db.get_all_users()  # Returns list of dicts: {"user_id": ..., "display_name": ...}
     # Available participants: all except the spender and those already selected.
     selected = context.user_data.get("selected_participants", [])
     available = [u for u in all_users if u["user_id"] != spender_id and u["user_id"] not in selected]
@@ -110,7 +117,6 @@ async def ae_select_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     keyboard.append([InlineKeyboardButton("Done", callback_data="select_done")])
     selected_names = ", ".join([str(uid) for uid in selected]) or "None"
     text = f"Select participants for this expense.\nAlready selected: {selected_names}"
-    # Send (or edit) a message with the inline keyboard.
     if update.message:
         sent = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
@@ -162,7 +168,6 @@ async def ae_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             context.user_data["selected_participants"] = []
         if uid not in context.user_data["selected_participants"]:
             context.user_data["selected_participants"].append(uid)
-        # Rebuild inline keyboard.
         all_users = await db.get_all_users()
         available = [u for u in all_users if u["user_id"] != spender_id and u["user_id"] not in context.user_data["selected_participants"]]
         keyboard = []
@@ -235,7 +240,6 @@ async def cp_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     msg = "Payments pending confirmation:\n"
     for tx in pending_conf:
         marked = await db.get_marked_debtors(tx["id"])
-        # Get display names for marked debtors.
         marked_names = []
         for debtor in marked:
             name = await db.get_user(debtor)
@@ -332,14 +336,8 @@ async def view_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         msg = "No transactions to show. Enjoy your day, oga!"
     await update.message.reply_text(msg, reply_markup=get_main_menu(), parse_mode="Markdown")
 
-# --- Startup and Shutdown Functions ---
-async def on_startup(app):
-    await db.init_db()
-
-async def on_shutdown(app):
-    await db.close_db()
-
-def main():
+# --- Async Main Function ---
+async def main():
     TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN environment variable not set.")
@@ -395,7 +393,12 @@ def main():
     application.add_handler(MessageHandler(filters.Regex("^View Summary 📊$"), view_summary))
     application.add_handler(CommandHandler("summary", view_summary))
 
-    application.run_polling(on_startup=on_startup, on_shutdown=on_shutdown)
+    # Initialize the database pool.
+    await db.init_db()
+    # Run polling (this call is blocking until the bot is stopped).
+    await application.run_polling()
+    # On shutdown, close the database pool.
+    await db.close_db()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

@@ -1,6 +1,9 @@
 import os
 import logging
 import asyncio
+import nest_asyncio  # <-- added import
+nest_asyncio.apply()  # <-- patch the running loop
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
